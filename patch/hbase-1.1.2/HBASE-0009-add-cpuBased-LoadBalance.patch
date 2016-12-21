@@ -1,0 +1,691 @@
+ .../java/org/apache/hadoop/hbase/ServerLoad.java   |   4 +
+ .../hadoop/hbase/ipc/MetricsHBaseServerSource.java |   6 +
+ .../hbase/ipc/MetricsHBaseServerSourceImpl.java    |  14 ++
+ .../hadoop/metrics2/lib/MutableHistogram.java      |   9 ++
+ .../protobuf/generated/ClusterStatusProtos.java    | 123 ++++++++++++++--
+ .../src/main/protobuf/ClusterStatus.proto          |   1 +
+ .../apache/hadoop/hbase/ThreadPoolMetricChore.java |  21 +--
+ .../hbase/master/balancer/BaseLoadBalancer.java    |  31 +++-
+ .../master/balancer/CpuBasedLoadBalancer.java      | 163 +++++++++++++++++++++
+ .../hbase/master/balancer/SimpleLoadBalancer.java  |   2 +-
+ .../master/balancer/StochasticLoadBalancer.java    |  16 +-
+ .../hadoop/hbase/regionserver/HRegionServer.java   |   8 +-
+ .../hbase/master/balancer/BalancerTestBase.java    |   2 +-
+ .../master/balancer/TestBaseLoadBalancer.java      |  16 +-
+ .../balancer/TestStochasticLoadBalancer.java       |  14 +-
+ 15 files changed, 370 insertions(+), 60 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ServerLoad.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ServerLoad.java
+index 3d502c0..63227d7 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/ServerLoad.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ServerLoad.java
+@@ -217,6 +217,10 @@ public class ServerLoad {
+     return getNumberOfRegions();
+   }
+ 
++  public long getActiveHandlerRatio() {
++    return serverLoad.getActiveHandlerRatio();
++  }
++
+   /**
+    * @return region load metrics
+    */
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+index eaaec7a..b16eb69 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+@@ -40,6 +40,8 @@ public interface MetricsHBaseServerSource extends BaseSource {
+   String RECEIVED_BYTES_DESC = "Number of bytes received.";
+   String QUEUE_CALL_TIME_NAME = "queueCallTime";
+   String QUEUE_CALL_TIME_DESC = "Queue Call Time.";
++  String HANDLER_RATIO_NAME = "activeHandlerHis";
++  String HANDLER_RATIO_DESC = "Active Handler Utilization Ratio.";
+   String PROCESS_CALL_TIME_NAME = "processCallTime";
+   String PROCESS_CALL_TIME_DESC = "Processing call time.";
+   String TOTAL_CALL_TIME_NAME = "totalCallTime";
+@@ -101,4 +103,8 @@ public interface MetricsHBaseServerSource extends BaseSource {
+   void queuedAndProcessedCall(int totalTime);
+ 
+   void responseTooSlow();
++
++  double getActiveHandlerMean();
++
++  void activedHandler();
+ }
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+index 8132d8f..1146a37 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+@@ -52,6 +52,7 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
+   private MutableHistogram queueCallTime;
+   private MutableHistogram processCallTime;
+   private MutableHistogram totalCallTime;
++  private MutableHistogram activeHandlerHis;
+ 
+   public MetricsHBaseServerSourceImpl(String metricsName,
+                                       String metricsDescription,
+@@ -90,6 +91,7 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
+         RECEIVED_BYTES_DESC, 0L);
+     this.queueCallTime = this.getMetricsRegistry().newHistogram(QUEUE_CALL_TIME_NAME,
+         QUEUE_CALL_TIME_DESC);
++    this.activeHandlerHis = this.getMetricsRegistry().newHistogram(HANDLER_RATIO_NAME, HANDLER_RATIO_DESC);
+     this.processCallTime = this.getMetricsRegistry().newHistogram(PROCESS_CALL_TIME_NAME,
+         PROCESS_CALL_TIME_DESC);
+     this.totalCallTime = this.getMetricsRegistry().newHistogram(TOTAL_CALL_TIME_NAME,
+@@ -183,6 +185,18 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
+   }
+ 
+   @Override
++  public double getActiveHandlerMean(){
++    return activeHandlerHis.getSampleMean();
++  }
++
++  @Override
++  public void activedHandler(){
++    if (wrapper != null) {
++      activeHandlerHis.add(wrapper.getActiveRpcHandlerCount());
++    }
++  }
++
++  @Override
+   public void getMetrics(MetricsCollector metricsCollector, boolean all) {
+     MetricsRecordBuilder mrb = metricsCollector.addRecord(metricsName);
+ 
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/metrics2/lib/MutableHistogram.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/metrics2/lib/MutableHistogram.java
+index 381dbbb..752b657 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/metrics2/lib/MutableHistogram.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/metrics2/lib/MutableHistogram.java
+@@ -112,6 +112,15 @@ public class MutableHistogram extends MutableMetric implements MetricHistogram {
+     return 0.0;
+   }
+ 
++  public double getSampleMean(){
++    Snapshot s = sample.getSnapshot();
++    double total = 0d;
++    for(double value : s.getValues()){
++      total += value;
++    }
++    return total/s.size();
++  }
++
+   @Override
+   public void snapshot(MetricsRecordBuilder metricsRecordBuilder, boolean all) {
+     if (all || changed()) {
+diff --git a/hbase-protocol/src/main/protobuf/ClusterStatus.proto b/hbase-protocol/src/main/protobuf/ClusterStatus.proto
+index 597d553..ab4fbc2 100644
+--- a/hbase-protocol/src/main/protobuf/ClusterStatus.proto
++++ b/hbase-protocol/src/main/protobuf/ClusterStatus.proto
+@@ -203,6 +203,7 @@ message ServerLoad {
+    * The replicationLoadSink for the replication Sink status of this region server.
+    */
+   optional ReplicationLoadSink replLoadSink = 11;
++  optional uint64 active_handler_ratio = 12;
+ }
+ 
+ message LiveServerInfo {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ThreadPoolMetricChore.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ThreadPoolMetricChore.java
+index e42d9f8..e3e461e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ThreadPoolMetricChore.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ThreadPoolMetricChore.java
+@@ -5,7 +5,8 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.executor.ExecutorService;
+ import org.apache.hadoop.hbase.executor.ExecutorService.ExecutorStatus;
+-import org.apache.hadoop.hbase.regionserver.MetricsRegionServerSource;
++import org.apache.hadoop.hbase.ipc.MetricsHBaseServerSource;
++import org.apache.hadoop.hbase.regionserver.HRegionServer;
+ import org.apache.hadoop.metrics2.lib.DynamicMetricsRegistry;
+ import org.apache.hadoop.metrics2.lib.MutableGaugeLong;
+ import org.apache.hadoop.util.StringUtils;
+@@ -14,14 +15,15 @@ import org.apache.hadoop.hbase.regionserver.MetricsRegionServerSourceImpl;
+ public class ThreadPoolMetricChore extends ScheduledChore {
+   private static Log LOG = LogFactory.getLog(ThreadPoolMetricChore.class);
+   private ExecutorService service;
+-  private DynamicMetricsRegistry metricsRegistry;
++  private DynamicMetricsRegistry rsRegistry;
++  private MetricsHBaseServerSource ipcSource;
+ 
+-  public ThreadPoolMetricChore(int sleepTime, Stoppable stopper, ExecutorService service,
+-      MetricsRegionServerSource metrics) {
+-    super("ThreadPoolMetric", stopper, sleepTime);
++  public ThreadPoolMetricChore(int sleepTime, HRegionServer rs) {
++    super("ThreadPoolMetric", rs, sleepTime);
+     LOG.info("ThreadPoolMetric Chore runs every " + StringUtils.formatTime(sleepTime));
+-    this.service = service;
+-    this.metricsRegistry = ((MetricsRegionServerSourceImpl) metrics).getMetricsRegistry();
++    this.service = rs.getExecutorService();
++    this.rsRegistry = ((MetricsRegionServerSourceImpl)rs.getRegionServerMetrics().getMetricsSource()).getMetricsRegistry();
++    this.ipcSource = rs.getRpcServer().getMetrics().getMetricsSource();
+   }
+ 
+   @Override
+@@ -31,8 +33,8 @@ public class ThreadPoolMetricChore extends ScheduledChore {
+       String name = statusEntry.getKey();
+       String poolName = name.split("-")[0];
+       ExecutorStatus status = statusEntry.getValue();
+-      MutableGaugeLong queued = metricsRegistry.getLongGauge(poolName + "_queued", 0L);
+-      MutableGaugeLong running = metricsRegistry.getLongGauge(poolName + "_running", 0L);
++      MutableGaugeLong queued = rsRegistry.getLongGauge(poolName + "_queued", 0L);
++      MutableGaugeLong running = rsRegistry.getLongGauge(poolName + "_running", 0L);
+       int queueSize = status.getQueuedEvents().size();
+       int runningSize = status.getRunning().size();
+       if(queueSize > 0){
+@@ -41,5 +43,6 @@ public class ThreadPoolMetricChore extends ScheduledChore {
+       queued.set(queueSize);
+       running.set(runningSize);
+     }
++    ipcSource.activedHandler();
+   }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+index 97afa49..e7cd11e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+@@ -33,7 +33,6 @@ import java.util.NavigableMap;
+ import java.util.Random;
+ import java.util.Set;
+ import java.util.TreeMap;
+-
+ import org.apache.commons.lang.NotImplementedException;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -42,9 +41,9 @@ import org.apache.hadoop.hbase.ClusterStatus;
+ import org.apache.hadoop.hbase.HBaseIOException;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.RegionLoad;
++import org.apache.hadoop.hbase.ServerLoad;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.client.RegionReplicaUtil;
+-import org.apache.hadoop.hbase.conf.ConfigurationObserver;
+ import org.apache.hadoop.hbase.master.LoadBalancer;
+ import org.apache.hadoop.hbase.master.MasterServices;
+ import org.apache.hadoop.hbase.master.RackManager;
+@@ -105,6 +104,7 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+     int[]   serverIndexToRackIndex;      //serverIndex -> rack index
+ 
+     int[][] regionsPerServer;            //serverIndex -> region list
++    double[] loadsPerServer;             //serverIndex -> rs load
+     int[][] regionsPerHost;              //hostIndex -> list of regions
+     int[][] regionsPerRack;              //rackIndex -> region list
+     int[][] primariesOfRegionsPerServer; //serverIndex -> sorted list of regions by primary region index
+@@ -144,9 +144,10 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+         Map<ServerName, List<HRegionInfo>> clusterState,
+         Map<String, Deque<RegionLoad>> loads,
+         RegionLocationFinder regionFinder,
+-        RackManager rackManager) {
++        RackManager rackManager,
++        ClusterStatus status) {
+       this(null, clusterState, loads, regionFinder,
+-        rackManager);
++        rackManager, status);
+     }
+ 
+     @SuppressWarnings("unchecked")
+@@ -155,7 +156,8 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+         Map<ServerName, List<HRegionInfo>> clusterState,
+         Map<String, Deque<RegionLoad>> loads,
+         RegionLocationFinder regionFinder,
+-        RackManager rackManager) {
++        RackManager rackManager,
++        ClusterStatus status) {
+ 
+       if (unassignedRegions == null) {
+         unassignedRegions = EMPTY_REGION_LIST;
+@@ -169,7 +171,6 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+       //TODO: We should get the list of tables from master
+       tables = new ArrayList<String>();
+       this.rackManager = rackManager != null ? rackManager : new DefaultRackManager();
+-
+       numRegions = 0;
+ 
+       List<List<Integer>> serversPerHostList = new ArrayList<List<Integer>>();
+@@ -222,6 +223,7 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+       serverIndexToHostIndex = new int[numServers];
+       serverIndexToRackIndex = new int[numServers];
+       regionsPerServer = new int[numServers][];
++      loadsPerServer = new double[numServers];
+       regionsPerHost = new int[numHosts][];
+       regionsPerRack = new int[numRacks][];
+       primariesOfRegionsPerServer = new int[numServers][];
+@@ -247,6 +249,13 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+         } else {
+           regionsPerServer[serverIndex] = new int[entry.getValue().size()];
+         }
++
++        if(status != null){
++          ServerLoad load = status.getLoad(servers[serverIndex]);
++          loadsPerServer[serverIndex] = (load != null) ? load.getActiveHandlerRatio() : -1d;
++        } else {
++          loadsPerServer[serverIndex] = -1d;
++        }
+         primariesOfRegionsPerServer[serverIndex] = new int[regionsPerServer[serverIndex].length];
+         serverIndicesSortedByRegionCount[serverIndex] = serverIndex;
+       }
+@@ -530,11 +539,19 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+       case NULL: break;
+       case ASSIGN_REGION:
+         AssignRegionAction ar = (AssignRegionAction) action;
++        loadsPerServer[ar.server] += (loadsPerServer[ar.server] / regionsPerServer[ar.server].length);
+         regionsPerServer[ar.server] = addRegion(regionsPerServer[ar.server], ar.region);
+         regionMoved(ar.region, -1, ar.server);
+         break;
+       case MOVE_REGION:
+         MoveRegionAction mra = (MoveRegionAction) action;
++        double avgLoadPerRegion = loadsPerServer[mra.fromServer] / regionsPerServer[mra.fromServer].length;
++        loadsPerServer[mra.fromServer] -= avgLoadPerRegion;
++        if(loadsPerServer[mra.toServer] == 0 || regionsPerServer[mra.toServer].length == 0){
++          loadsPerServer[mra.toServer] += avgLoadPerRegion;
++        }else{
++          loadsPerServer[mra.toServer] += loadsPerServer[mra.toServer] / regionsPerServer[mra.toServer].length;
++        }
+         regionsPerServer[mra.fromServer] = removeRegion(regionsPerServer[mra.fromServer], mra.region);
+         regionsPerServer[mra.toServer] = addRegion(regionsPerServer[mra.toServer], mra.region);
+         regionMoved(mra.region, mra.fromServer, mra.toServer);
+@@ -1096,7 +1113,7 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+       }
+     }
+     return new Cluster(regions, clusterState, null, this.regionFinder,
+-      rackManager);
++      rackManager, this.clusterStatus);
+   }
+ 
+   /**
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/CpuBasedLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/CpuBasedLoadBalancer.java
+new file mode 100644
+index 0000000..1a17bb1
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/CpuBasedLoadBalancer.java
+@@ -0,0 +1,163 @@
++package org.apache.hadoop.hbase.master.balancer;
++
++import java.util.ArrayList;
++import java.util.List;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.Action;
++
++public class CpuBasedLoadBalancer extends StochasticLoadBalancer {
++  
++  private static final String CPU_CONSIDER = "hbase.master.balancer.cpu.consider";
++  private static final String MIN_REGION_NUM = "hbase.master.balancer.region.minNum";
++  private boolean cpuConsider = true;
++  @Override
++  public synchronized void setConf(Configuration conf) {
++    super.setConf(conf);
++    cpuConsider = conf.getBoolean(CPU_CONSIDER, true);
++    if(cpuConsider){
++      candidateGenerators = new CandidateGenerator[] {
++          new CpuBasedRandomGenerator(conf),
++          new CpuLoadCandidateGenerator(conf),
++          localityCandidateGenerator,
++          new RegionReplicaRackCandidateGenerator()
++      };
++      regionLoadFunctions = new CostFromRegionLoadFunction[] {};
++      costFunctions = new CostFunction[]{
++          new CpuLoadSkewCostFunction(conf),
++          new MoveCostFunction(conf),
++          localityCost,
++          new TableSkewCostFunction(conf),
++          regionReplicaHostCostFunction,
++          regionReplicaRackCostFunction
++      };
++    }
++  }
++
++  @Override
++  protected boolean needsBalance(Cluster c) {
++    if(!cpuConsider){
++      return super.needsBalance(c);
++    } else {
++      ClusterLoadState cs = new ClusterLoadState(c.clusterState);
++      if (cs.getNumServers() < 2) {
++        return false;
++      }
++      if(areSomeRegionReplicasColocated(c)) return true;
++      double minLoad = Double.MAX_VALUE;
++      double maxLoad = Double.MIN_VALUE;
++      int servers = 0;
++      long totalLoad = 0;
++      for(int i = 0; i < c.loadsPerServer.length; i++){
++        double load = c.loadsPerServer[i];
++        if(load < 0d){
++          continue;
++        }
++        if(load > maxLoad){
++          maxLoad = load;
++        }
++        if(load < minLoad){
++          minLoad = load;
++        }
++        totalLoad += load;
++        servers++;
++      }
++      
++      float average = totalLoad/servers;
++      int floor = (int) Math.floor(average * (1 - slop));
++      int ceiling = (int) Math.ceil(average * (1 + slop));
++      if ( servers < 2 || !(maxLoad > ceiling || minLoad < floor)) {
++        return false;
++      }
++      return true;
++    }
++  }
++
++  static class CpuLoadSkewCostFunction extends CostFunction {
++    private static final String CPU_LOAD_SKEW_COST_KEY =
++        "hbase.master.balancer.stochastic.cpuLoad";
++    private static final float DEFAULT_CPU_LOAD_SKEW_COST = 500;
++    CpuLoadSkewCostFunction(Configuration conf) {
++      super(conf);
++      this.setMultiplier(conf.getFloat(CPU_LOAD_SKEW_COST_KEY, DEFAULT_CPU_LOAD_SKEW_COST));
++    }
++
++    @Override
++    double cost() {
++      List<Double> tmpList = new ArrayList<Double>();
++      for (int i = 0; i < cluster.loadsPerServer.length; i++) {
++        if(cluster.loadsPerServer[i] >= 0){
++          tmpList.add(cluster.loadsPerServer[i]);
++        }
++      }
++      double[] stats = new double[tmpList.size()];
++      for(int i = 0; i < tmpList.size(); i++){
++        stats[i] = tmpList.get(i);
++      }
++      return costFromArray(stats);
++    }
++  }
++  
++  static class CpuBasedRandomGenerator extends CandidateGenerator {
++    private int minRegionNum = 10;
++    public CpuBasedRandomGenerator(Configuration conf) {
++      minRegionNum = conf.getInt(MIN_REGION_NUM, 10);
++    }
++    @Override
++    Action generate(Cluster cluster) {
++      int thisServer = pickRandomServer(cluster);
++      int otherServer = pickOtherRandomServer(cluster, thisServer);
++      double thisLoad = cluster.loadsPerServer[thisServer];
++      double otherLoad = cluster.loadsPerServer[otherServer];
++      if (thisServer < 0 || otherServer < 0 || thisLoad < 0d || 
++          otherLoad < 0d || thisLoad == otherLoad) {
++        return Cluster.NullAction;
++      }
++      double thisChance = thisLoad > otherLoad ? 0 : 0.5;
++      double otherChance = thisLoad < otherLoad ? 0 : 0.5;
++      int thisRegion = pickRandomRegion(cluster, thisServer, thisChance);
++      int otherRegion = pickRandomRegion(cluster, otherServer, otherChance);
++      // if the num of regions has achieved minRegionNum, don't move any region
++      if((thisRegion > 0 && otherRegion < 0 && cluster.regionsPerServer[thisServer].length <= minRegionNum) ||
++          (otherRegion > 0 && thisRegion < 0 && cluster.regionsPerServer[otherServer].length <= minRegionNum)){
++        return Cluster.NullAction;
++      }
++      return getAction(thisServer, thisRegion, otherServer, otherRegion);
++    }
++  }
++
++  static class CpuLoadCandidateGenerator extends CandidateGenerator {
++    private int minRegionNum = 10;
++    public CpuLoadCandidateGenerator(Configuration conf) {
++      minRegionNum = conf.getInt(MIN_REGION_NUM, 10);
++    }
++    @Override
++    Action generate(Cluster cluster) {
++      int minIndex = -1;
++      int maxIndex = -1;
++      double minLoad = Double.MAX_VALUE;
++      double maxLoad = Double.MIN_VALUE;
++      for(int i = 0; i < cluster.loadsPerServer.length; i++){
++        double load = cluster.loadsPerServer[i];
++        if(load < 0){
++          continue;
++        }
++        if(load > maxLoad){
++          maxLoad = load;
++          maxIndex = i;
++        }
++        if(load < minLoad){
++          minLoad = load;
++          minIndex = i;
++        }
++      }
++      if(minLoad == maxLoad || maxIndex < 0 || minIndex < 0 
++          || minLoad < 0 || maxLoad < 0
++          || cluster.regionsPerServer[maxIndex].length <= minRegionNum){
++        return Cluster.NullAction;
++      }
++      int thisRegion = pickRandomRegion(cluster, maxIndex, 0);
++      int otherRegion = pickRandomRegion(cluster, minIndex, 1);
++      return getAction(maxIndex, thisRegion, minIndex, otherRegion);
++    }
++  }
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/SimpleLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/SimpleLoadBalancer.java
+index 9673acf..45e2875 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/SimpleLoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/SimpleLoadBalancer.java
+@@ -198,7 +198,7 @@ public class SimpleLoadBalancer extends BaseLoadBalancer {
+ 
+     // construct a Cluster object with clusterMap and rest of the
+     // argument as defaults
+-    Cluster c = new Cluster(clusterMap, null, this.regionFinder, this.rackManager);
++    Cluster c = new Cluster(clusterMap, null, this.regionFinder, this.rackManager, this.clusterStatus);
+     if (!this.needsBalance(c)) return null;
+ 
+     ClusterLoadState cs = new ClusterLoadState(clusterMap);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+index e58f855..98cf727 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+@@ -114,15 +114,15 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+   private long maxRunningTime = 30 * 1000 * 1; // 30 seconds.
+   private int numRegionLoadsToRemember = 15;
+ 
+-  private CandidateGenerator[] candidateGenerators;
+-  private CostFromRegionLoadFunction[] regionLoadFunctions;
+-  private CostFunction[] costFunctions;
++  protected CandidateGenerator[] candidateGenerators;
++  protected CostFromRegionLoadFunction[] regionLoadFunctions;
++  protected CostFunction[] costFunctions;
+   // Keep locality based picker and cost function to alert them
+   // when new services are offered
+-  private LocalityBasedCandidateGenerator localityCandidateGenerator;
+-  private LocalityCostFunction localityCost;
+-  private RegionReplicaHostCostFunction regionReplicaHostCostFunction;
+-  private RegionReplicaRackCostFunction regionReplicaRackCostFunction;
++  protected LocalityBasedCandidateGenerator localityCandidateGenerator;
++  protected LocalityCostFunction localityCost;
++  protected RegionReplicaHostCostFunction regionReplicaHostCostFunction;
++  protected RegionReplicaRackCostFunction regionReplicaRackCostFunction;
+ 
+   @Override
+   public void onConfigurationChange(Configuration conf) {
+@@ -241,7 +241,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+     //The clusterState that is given to this method contains the state
+     //of all the regions in the table(s) (that's true today)
+     // Keep track of servers to iterate through them.
+-    Cluster cluster = new Cluster(clusterState, loads, finder, rackManager);
++    Cluster cluster = new Cluster(clusterState, loads, finder, rackManager, this.clusterStatus);
+     if (!needsBalance(cluster)) {
+       return null;
+     }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index d985dee..ce2b9e0 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -1215,7 +1215,10 @@ public class HRegionServer extends HasThread implements
+         }
+       }
+     }
+-
++    double activeHandlerMean = getRpcServer().getMetrics().getMetricsSource().getActiveHandlerMean();
++    int totalHandler = this.conf.getInt(HConstants.REGION_SERVER_HANDLER_COUNT, HConstants.DEFAULT_REGION_SERVER_HANDLER_COUNT);
++    long handlerRatio = Math.round(activeHandlerMean * 1000 / totalHandler);
++    serverLoad.setActiveHandlerRatio(handlerRatio);
+     return serverLoad.build();
+   }
+ 
+@@ -1372,8 +1375,7 @@ public class HRegionServer extends HasThread implements
+ 
+       if(this.conf.getBoolean(HConstants.EXCUTOR_METRIC_ENABLE, false)){
+         int sleepTime = this.conf.getInt(HConstants.EXCUTOR_METRIC_CHORE_WAKE_FREQ, HConstants.DEFAULT_THREAD_WAKE_FREQUENCY);
+-        executorMetricsChore = new ThreadPoolMetricChore(sleepTime, this, this.getExecutorService(),
+-            this.getRegionServerMetrics().getMetricsSource());
++        executorMetricsChore = new ThreadPoolMetricChore(sleepTime, this);
+         choreService.scheduleChore(executorMetricsChore);
+       }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
+index 2527ed5..89170e4 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
+@@ -241,7 +241,7 @@ public class BalancerTestBase {
+ 
+   protected BaseLoadBalancer.Cluster mockCluster(int[] mockCluster) {
+     return new BaseLoadBalancer.Cluster(
+-      mockClusterServers(mockCluster, -1), null, null, null);
++      mockClusterServers(mockCluster, -1), null, null, null, null);
+   }
+ 
+   protected TreeMap<ServerName, List<HRegionInfo>> mockClusterServers(int[] mockCluster, int numTables) {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestBaseLoadBalancer.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestBaseLoadBalancer.java
+index 3bdae33..86ff729 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestBaseLoadBalancer.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestBaseLoadBalancer.java
+@@ -244,7 +244,7 @@ public class TestBaseLoadBalancer extends BalancerTestBase {
+     // cluster is created (constructor code) would make sure the indices of
+     // the servers are in the order in which it is inserted in the clusterState
+     // map (linkedhashmap is important). A similar thing applies to the region lists
+-    Cluster cluster = new Cluster(clusterState, null, null, rackManager);
++    Cluster cluster = new Cluster(clusterState, null, null, rackManager, null);
+     // check whether a move of region1 from servers[0] to servers[1] would lower
+     // the availability of region1
+     assertTrue(cluster.wouldLowerAvailability(hri1, servers[1]));
+@@ -261,7 +261,7 @@ public class TestBaseLoadBalancer extends BalancerTestBase {
+     // now lets have servers[1] host replica_of_region2
+     list1.add(RegionReplicaUtil.getRegionInfoForReplica(hri3, 1));
+     // create a new clusterState with the above change
+-    cluster = new Cluster(clusterState, null, null, rackManager);
++    cluster = new Cluster(clusterState, null, null, rackManager, null);
+     // now check whether a move of a replica from servers[0] to servers[1] would lower
+     // the availability of region2
+     assertTrue(cluster.wouldLowerAvailability(hri3, servers[1]));
+@@ -273,14 +273,14 @@ public class TestBaseLoadBalancer extends BalancerTestBase {
+     clusterState.put(servers[6], list2); //servers[6], rack2 hosts region2
+     clusterState.put(servers[10], new ArrayList<HRegionInfo>()); //servers[10], rack3 hosts no region
+     // create a cluster with the above clusterState
+-    cluster = new Cluster(clusterState, null, null, rackManager);
++    cluster = new Cluster(clusterState, null, null, rackManager, null);
+     // check whether a move of region1 from servers[0],rack1 to servers[6],rack2 would
+     // lower the availability
+ 
+     assertTrue(cluster.wouldLowerAvailability(hri1, servers[0]));
+ 
+     // now create a cluster without the rack manager
+-    cluster = new Cluster(clusterState, null, null, null);
++    cluster = new Cluster(clusterState, null, null, null, null);
+     // now repeat check whether a move of region1 from servers[0] to servers[6] would
+     // lower the availability
+     assertTrue(!cluster.wouldLowerAvailability(hri1, servers[6]));
+@@ -313,7 +313,7 @@ public class TestBaseLoadBalancer extends BalancerTestBase {
+     // cluster is created (constructor code) would make sure the indices of
+     // the servers are in the order in which it is inserted in the clusterState
+     // map (linkedhashmap is important).
+-    Cluster cluster = new Cluster(clusterState, null, null, rackManager);
++    Cluster cluster = new Cluster(clusterState, null, null, rackManager, null);
+     // check whether moving region1 from servers[1] to servers[2] would lower availability
+     assertTrue(!cluster.wouldLowerAvailability(hri1, servers[2]));
+ 
+@@ -333,7 +333,7 @@ public class TestBaseLoadBalancer extends BalancerTestBase {
+     clusterState.put(servers[6], list2); //servers[6], rack2 hosts region2
+     clusterState.put(servers[12], list3); //servers[12], rack3 hosts replica_of_region2
+     // create a cluster with the above clusterState
+-    cluster = new Cluster(clusterState, null, null, rackManager);
++    cluster = new Cluster(clusterState, null, null, rackManager, null);
+     // check whether a move of replica_of_region2 from servers[12],rack3 to servers[0],rack1 would
+     // lower the availability
+     assertTrue(!cluster.wouldLowerAvailability(hri4, servers[0]));
+@@ -419,7 +419,7 @@ public class TestBaseLoadBalancer extends BalancerTestBase {
+     assignRegions(regions, oldServers, clusterState);
+ 
+     // should not throw exception:
+-    BaseLoadBalancer.Cluster cluster = new Cluster(clusterState, null, null, null);
++    BaseLoadBalancer.Cluster cluster = new Cluster(clusterState, null, null, null, null);
+     assertEquals(101 + 9, cluster.numRegions);
+     assertEquals(10, cluster.numServers); // only 10 servers because they share the same host + port
+   }
+@@ -461,7 +461,7 @@ public class TestBaseLoadBalancer extends BalancerTestBase {
+     when(locationFinder.getTopBlockLocations(regions.get(43))).thenReturn(
+       Lists.newArrayList(ServerName.valueOf("foo", 0, 0))); // this server does not exists in clusterStatus
+ 
+-    BaseLoadBalancer.Cluster cluster = new Cluster(clusterState, null, locationFinder, null);
++    BaseLoadBalancer.Cluster cluster = new Cluster(clusterState, null, locationFinder, null, null);
+ 
+     int r0 = ArrayUtils.indexOf(cluster.regions, regions.get(0)); // this is ok, it is just a test
+     int r1 = ArrayUtils.indexOf(cluster.regions, regions.get(1));
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
+index ae40583..4de33f6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
+@@ -332,7 +332,7 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+ 
+     BaseLoadBalancer.Cluster cluster;
+ 
+-    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null);
++    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null, null);
+     costFunction.init(cluster);
+     double costWithoutReplicas = costFunction.cost();
+     assertEquals(0, costWithoutReplicas, 0);
+@@ -342,7 +342,7 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+       clusterState.firstEntry().getValue().get(0),1);
+     clusterState.lastEntry().getValue().add(replica1);
+ 
+-    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null);
++    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null, null);
+     costFunction.init(cluster);
+     double costWith1ReplicaDifferentServer = costFunction.cost();
+ 
+@@ -352,7 +352,7 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+     HRegionInfo replica2 = RegionReplicaUtil.getRegionInfoForReplica(replica1, 2);
+     clusterState.lastEntry().getValue().add(replica2);
+ 
+-    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null);
++    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null, null);
+     costFunction.init(cluster);
+     double costWith1ReplicaSameServer = costFunction.cost();
+ 
+@@ -375,7 +375,7 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+     entry.getValue().add(replica2);
+     it.next().getValue().add(replica3); //2nd server
+ 
+-    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null);
++    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null, null);
+     costFunction.init(cluster);
+     double costWith3ReplicasSameServer = costFunction.cost();
+ 
+@@ -389,7 +389,7 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+     clusterState.lastEntry().getValue().add(replica2);
+     clusterState.lastEntry().getValue().add(replica3);
+ 
+-    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null);
++    cluster = new BaseLoadBalancer.Cluster(clusterState, null, null, null, null);
+     costFunction.init(cluster);
+     double costWith2ReplicasOnTwoServers = costFunction.cost();
+ 
+@@ -409,7 +409,7 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+     // until the step above s1 holds two replicas of a region
+     regions = randomRegions(1);
+     map.put(s2, regions);
+-    assertTrue(loadBalancer.needsBalance(new Cluster(map, null, null, null)));
++    assertTrue(loadBalancer.needsBalance(new Cluster(map, null, null, null, null)));
+     // check for the case where there are two hosts on the same rack and there are two racks
+     // and both the replicas are on the same rack
+     map.clear();
+@@ -421,7 +421,7 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+     // add another server so that the cluster has some host on another rack
+     map.put(ServerName.valueOf("host2", 1000, 11111), randomRegions(1));
+     assertTrue(loadBalancer.needsBalance(new Cluster(map, null, null,
+-        new ForTestRackManagerOne())));
++        new ForTestRackManagerOne(), null)));
+   }
+ 
+   @Test (timeout = 60000)

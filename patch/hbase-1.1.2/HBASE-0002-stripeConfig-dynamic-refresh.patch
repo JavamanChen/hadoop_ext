@@ -1,0 +1,21 @@
+ .../hbase/regionserver/compactions/StripeCompactionPolicy.java      | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/StripeCompactionPolicy.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/StripeCompactionPolicy.java
+index 0d49f09..9b7c12d 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/StripeCompactionPolicy.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/StripeCompactionPolicy.java
+@@ -182,6 +182,12 @@ public class StripeCompactionPolicy extends CompactionPolicy {
+     return false;
+   }
+ 
++  @Override
++  public void setConf(Configuration conf) {
++    super.setConf(conf);
++    this.config = new StripeStoreConfig(conf, storeConfigInfo);
++    this.stripePolicy.setConf(conf);
++  }
++  
+   protected StripeCompactionRequest selectSingleStripeCompaction(StripeInformationProvider si,
+       boolean includeL0, boolean canDropDeletesWithoutL0, boolean isOffpeak) throws IOException {
+     ArrayList<ImmutableList<StoreFile>> stripes = si.getStripes();

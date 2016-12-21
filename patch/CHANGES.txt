@@ -1,0 +1,2 @@
+[HBASE-14489] postScannerFilterRow consumes a lot of CPU
+[HBASE-14061] Support CF-level Storage Policy

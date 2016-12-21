@@ -1,0 +1,49 @@
+ .../hadoop/hbase/regionserver/wal/FSHLog.java       | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+index 47bdbc1..1033419 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+@@ -1934,7 +1934,9 @@ public class FSHLog implements WAL {
+     }
+ 
+     private void cleanupOutstandingSyncsOnException(final long sequence, final Exception e) {
+-      for (int i = 0; i < this.syncFuturesCount; i++) this.syncFutures[i].done(sequence, e);
++      for (int i = 0; i < this.syncFuturesCount; i++) {
++        this.syncFutures[i].done(sequence, e);
++      }
+       this.syncFuturesCount = 0;
+     }
+ 
+@@ -2019,7 +2021,10 @@ public class FSHLog implements WAL {
+         // Wait on outstanding syncers; wait for them to finish syncing (unless we've been
+         // shutdown or unless our latch has been thrown because we have been aborted).
+         while (!this.shutdown && this.zigzagLatch.isCocked() &&
+-            highestSyncedSequence.get() < currentSequence) {
++            highestSyncedSequence.get() < currentSequence
++            // We could be in here and all syncs are failing or failed. Check for this. Otherwise
++            // we'll just be stuck here for ever. In other words, ensure there syncs running.
++            && isOutstandingSyncs()) {
+           synchronized (this.safePointWaiter) {
+             this.safePointWaiter.wait(0, 1);
+           }
+@@ -2032,6 +2037,18 @@ public class FSHLog implements WAL {
+       }
+     }
+ 
++    /**
++     * @return True if outstanding sync futures still
++     */
++    private boolean isOutstandingSyncs() {
++      for (int i = 0; i < this.syncFuturesCount; i++) {
++        if (!this.syncFutures[i].isDone()) {
++          return true;
++        }
++      }
++      return false;
++    }
++
+     private void updateOldestUnflushedSequenceIds(byte[] encodedRegionName,
+         Set<byte[]> familyNameSet, Long lRegionSequenceId) {
+       ConcurrentMap<byte[], Long> oldestUnflushedStoreSequenceIdsOfRegion =

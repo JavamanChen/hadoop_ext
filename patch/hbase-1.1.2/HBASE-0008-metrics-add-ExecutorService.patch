@@ -1,0 +1,163 @@
+ .../java/org/apache/hadoop/hbase/HConstants.java   |  7 +++-
+ .../apache/hadoop/hbase/ThreadPoolMetricChore.java | 40 ++++++++++++++++++++++
+ .../hadoop/hbase/executor/ExecutorService.java     | 10 +++++-
+ .../hadoop/hbase/regionserver/HRegionServer.java   | 14 +++++++-
+ 4 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index ef3f699..8368e36 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -19,7 +19,6 @@ package org.apache.hadoop.hbase;
+ 
+ import static org.apache.hadoop.hbase.io.hfile.BlockType.MAGIC_LENGTH;
+ 
+-import java.nio.ByteBuffer;
+ import java.nio.charset.Charset;
+ import java.util.Arrays;
+ import java.util.Collections;
+@@ -1026,6 +1025,12 @@ public final class HConstants {
+   public static final String HEALTH_CHORE_WAKE_FREQ =
+       "hbase.node.health.script.frequency";
+   public static final long DEFAULT_HEALTH_SCRIPT_TIMEOUT = 60000;
++  
++  /** ThreadPool dump related settings. */
++  public static final String EXCUTOR_METRIC_ENABLE = "hbase.executor.metric.enable";
++  public static final String EXCUTOR_METRIC_CHORE_WAKE_FREQ =
++      "hbase.executor.metric.frequency";
++
+   /**
+    * The maximum number of health check failures a server can encounter consecutively.
+    */
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ThreadPoolMetricChore.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ThreadPoolMetricChore.java
+new file mode 100644
+index 0000000..6133ec2
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ThreadPoolMetricChore.java
+@@ -0,0 +1,40 @@
++package org.apache.hadoop.hbase;
++
++import java.util.Map;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.executor.ExecutorService;
++import org.apache.hadoop.hbase.executor.ExecutorService.ExecutorStatus;
++import org.apache.hadoop.hbase.regionserver.MetricsRegionServerSource;
++import org.apache.hadoop.metrics2.lib.DynamicMetricsRegistry;
++import org.apache.hadoop.metrics2.lib.MutableGaugeLong;
++import org.apache.hadoop.util.StringUtils;
++import org.apache.hadoop.hbase.regionserver.MetricsRegionServerSourceImpl;
++
++public class ThreadPoolMetricChore extends ScheduledChore {
++  private static Log LOG = LogFactory.getLog(ThreadPoolMetricChore.class);
++  private ExecutorService service;
++  private DynamicMetricsRegistry metricsRegistry;
++
++  public ThreadPoolMetricChore(int sleepTime, Stoppable stopper, ExecutorService service,
++      MetricsRegionServerSource metrics) {
++    super("ThreadPoolMetric", stopper, sleepTime);
++    LOG.info("ThreadPoolMetric Chore runs every " + StringUtils.formatTime(sleepTime));
++    this.service = service;
++    this.metricsRegistry = ((MetricsRegionServerSourceImpl) metrics).getMetricsRegistry();
++  }
++
++  @Override
++  protected void chore() {
++    Map<String, ExecutorStatus> statuses = service.getAllExecutorStatuses();
++    for (Map.Entry<String, ExecutorStatus> statusEntry : statuses.entrySet()) {
++      String name = statusEntry.getKey();
++      String poolName = name.split("-")[0];
++      ExecutorStatus status = statusEntry.getValue();
++      MutableGaugeLong queued = metricsRegistry.getLongGauge(poolName + "_queued", 0L);
++      MutableGaugeLong running = metricsRegistry.getLongGauge(poolName + "_running", 0L);
++      int queueSize = status.getQueuedEvents().size();
++      int runningSize = status.getRunning().size();
++      if(queueSize > 0){
++        LOG.warn(poolName + "'s size info, queued: " + queueSize +", running:" + runningSize);
++      }
++      queued.set(queueSize);
++      running.set(runningSize);
++    }
++  }
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/executor/ExecutorService.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/executor/ExecutorService.java
+index 42cca2b..836bc71 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/executor/ExecutorService.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/executor/ExecutorService.java
+@@ -308,7 +308,15 @@ public class ExecutorService {
+       this.queuedEvents = queuedEvents;
+       this.running = running;
+     }
+-   
++
++    public List<EventHandler> getQueuedEvents() {
++      return queuedEvents;
++    }
++
++    public List<RunningEventStatus> getRunning() {
++      return running;
++    }
++
+     /**
+      * Dump a textual representation of the executor's status
+      * to the given writer.
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index b36f635..d985dee 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -75,6 +75,7 @@ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.Stoppable;
+ import org.apache.hadoop.hbase.TableDescriptors;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.ThreadPoolMetricChore;
+ import org.apache.hadoop.hbase.YouAreDeadException;
+ import org.apache.hadoop.hbase.ZNodeClearer;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+@@ -386,6 +387,8 @@ public class HRegionServer extends HasThread implements
+   /** The health check chore. */
+   private HealthCheckChore healthCheckChore;
+ 
++  ThreadPoolMetricChore executorMetricsChore;
++
+   /** The nonce manager chore. */
+   private ScheduledChore nonceManagerChore;
+ 
+@@ -726,7 +729,6 @@ public class HRegionServer extends HasThread implements
+           HConstants.DEFAULT_THREAD_WAKE_FREQUENCY);
+         healthCheckChore = new HealthCheckChore(sleepTime, this, getConfiguration());
+       }
+-
+       initializeZooKeeper();
+       if (!isStopped() && !isAborted()) {
+         initializeThreads();
+@@ -991,6 +993,7 @@ public class HRegionServer extends HasThread implements
+     if (this.compactSplitThread != null) this.compactSplitThread.interruptIfNecessary();
+     if (this.compactionChecker != null) this.compactionChecker.cancel(true);
+     if (this.healthCheckChore != null) this.healthCheckChore.cancel(true);
++    if (this.executorMetricsChore != null) this.executorMetricsChore.cancel(true);
+     if (this.nonceManagerChore != null) this.nonceManagerChore.cancel(true);
+     if (this.storefileRefresher != null) this.storefileRefresher.cancel(true);
+     sendShutdownInterrupt();
+@@ -1366,6 +1369,14 @@ public class HRegionServer extends HasThread implements
+       pauseMonitor.start();
+ 
+       startServiceThreads();
++
++      if(this.conf.getBoolean(HConstants.EXCUTOR_METRIC_ENABLE, false)){
++        int sleepTime = this.conf.getInt(HConstants.EXCUTOR_METRIC_CHORE_WAKE_FREQ, HConstants.DEFAULT_THREAD_WAKE_FREQUENCY);
++        executorMetricsChore = new ThreadPoolMetricChore(sleepTime, this, this.getExecutorService(),
++            this.getRegionServerMetrics().getMetricsSource());
++        choreService.scheduleChore(executorMetricsChore);
++      }
++
+       startHeapMemoryManager();
+       LOG.info("Serving as " + this.serverName +
+         ", RpcServer on " + rpcServices.isa +
+@@ -2113,6 +2124,7 @@ public class HRegionServer extends HasThread implements
+     if (this.compactionChecker != null) compactionChecker.cancel(true);
+     if (this.periodicFlusher != null) periodicFlusher.cancel(true);
+     if (this.healthCheckChore != null) healthCheckChore.cancel(true);
++    if (this.executorMetricsChore != null) executorMetricsChore.cancel(true);
+     if (this.storefileRefresher != null) storefileRefresher.cancel(true);
+     if (this.movedRegionsCleaner != null) movedRegionsCleaner.cancel(true);
+ 

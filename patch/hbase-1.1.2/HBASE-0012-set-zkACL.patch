@@ -1,0 +1,108 @@
+Index: hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWatcher.java
+===================================================================
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWatcher.java	(revision 242090)
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWatcher.java	(working copy)
+@@ -21,6 +21,7 @@
+ import java.io.Closeable;
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -36,12 +37,14 @@
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.ZooKeeperConnectionException;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.util.ZKUtil.ZKAuthInfo;
+ import org.apache.zookeeper.KeeperException;
+ import org.apache.zookeeper.WatchedEvent;
+ import org.apache.zookeeper.Watcher;
+ import org.apache.zookeeper.ZooDefs;
+ import org.apache.zookeeper.ZooDefs.Ids;
+ import org.apache.zookeeper.ZooDefs.Perms;
++import org.apache.zookeeper.ZooKeeper;
+ import org.apache.zookeeper.data.ACL;
+ import org.apache.zookeeper.data.Id;
+ import org.apache.zookeeper.data.Stat;
+@@ -173,6 +176,22 @@
+     this.abortable = abortable;
+     setNodeNames(conf);
+     this.recoverableZooKeeper = ZKUtil.connect(conf, quorum, this, identifier);
++
++    if(!ZKUtil.isSecureZooKeeper(conf)){
++      ZooKeeper zkClient = recoverableZooKeeper.getZooKeeper();
++      String zkAuthConf = conf.get(HConstants.ZOOKEEPER_AUTH);
++      zkAuthConf = org.apache.hadoop.util.ZKUtil.resolveConfIndirection(zkAuthConf);
++      List<ZKAuthInfo> zkAuths;
++      if (zkAuthConf != null) {
++        zkAuths = org.apache.hadoop.util.ZKUtil.parseAuth(zkAuthConf);
++      } else {
++        zkAuths = Collections.emptyList();
++      }
++      for(ZKAuthInfo auth : zkAuths){
++        zkClient.addAuthInfo(auth.getScheme(), auth.getAuth());
++      }
++    }
++
+     if (canCreateBaseZNode) {
+       createBaseZNodes();
+     }
+Index: hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
+===================================================================
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java	(revision 242090)
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java	(working copy)
+@@ -1029,9 +1029,9 @@
+     if (!node.startsWith(zkw.baseZNode)) {
+       return Ids.OPEN_ACL_UNSAFE;
+     }
++    ArrayList<ACL> acls = new ArrayList<ACL>();
+     if (isSecureZooKeeper) {
+       String superUser = zkw.getConfiguration().get("hbase.superuser");
+-      ArrayList<ACL> acls = new ArrayList<ACL>();
+       // add permission to hbase supper user
+       if (superUser != null) {
+         acls.add(new ACL(Perms.ALL, new Id("auth", superUser)));
+@@ -1044,10 +1044,24 @@
+       } else {
+         acls.addAll(Ids.CREATOR_ALL_ACL);
+       }
+-      return acls;
+     } else {
+-      return Ids.OPEN_ACL_UNSAFE;
++      try {
++        String zkAclConf = zkw.getConfiguration().get(HConstants.ZOOKEEPER_ACL, HConstants.ZOOKEEPER_ACL_DEFAULT);
++        zkAclConf = org.apache.hadoop.util.ZKUtil.resolveConfIndirection(zkAclConf);
++        List<ACL> zkAcls = org.apache.hadoop.util.ZKUtil.parseACLs(zkAclConf);
++        if (zkAcls.isEmpty()) {
++          zkAcls = Ids.CREATOR_ALL_ACL;
++        }
++        acls.addAll(zkAcls);
++        if (zkw.isClientReadable(node)) {
++          acls.addAll(Ids.READ_ACL_UNSAFE);
++        }
++      } catch (IOException e) {
++        LOG.warn("ACL parse error", e);
++        return Ids.OPEN_ACL_UNSAFE;
++      }
+     }
++    return acls;
+   }
+ 
+   //
+Index: hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+===================================================================
+--- hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java	(revision 242090)
++++ hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java	(working copy)
+@@ -157,6 +157,11 @@
+   /** Name of ZooKeeper quorum configuration parameter. */
+   public static final String ZOOKEEPER_QUORUM = "hbase.zookeeper.quorum";
+ 
++  public static final String ZOOKEEPER_ACL = "hbase.zookeeper.acl";
++  public static final String ZOOKEEPER_ACL_DEFAULT = "world:anyone:rwcda";
++
++  public static final String ZOOKEEPER_AUTH = "hbase.zookeeper.auth";
++
+   /** Name of ZooKeeper config file in conf/ directory. */
+   public static final String ZOOKEEPER_CONFIG_NAME = "zoo.cfg";
+ 

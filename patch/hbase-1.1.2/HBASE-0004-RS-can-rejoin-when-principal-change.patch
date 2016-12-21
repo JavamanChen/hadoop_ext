@@ -1,0 +1,70 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientImpl.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientImpl.java
+index 4b96e31..496d4e8 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientImpl.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientImpl.java
+@@ -677,7 +677,7 @@ public class RpcClientImpl extends AbstractRpcClient {
+               }
+               //try re-login
+               if (UserGroupInformation.isLoginKeytabBased()) {
+-                UserGroupInformation.getLoginUser().reloginFromKeytab();
++                UserGroupInformation.getLoginUser().reloginFromKeytab(true);
+               } else {
+                 UserGroupInformation.getLoginUser().reloginFromTicketCache();
+               }
+
+diff --git a/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java b/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+--- a/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
++++ b/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+@@ -1056,3 +1056,3 @@
++  @InterfaceAudience.Public
++  @InterfaceStability.Evolving
++  public synchronized void reloginFromKeytab(boolean force) throws IOException {
++    if(!force){
++      reloginFromKeytab();
++      return;
++    }
++    if (!isSecurityEnabled() ||
++         user.getAuthenticationMethod() != AuthenticationMethod.KERBEROS ||
++         !isKeytab){
++      return;
++    }
++    long now = Time.now();
++    LoginContext login = getLogin();
++    if (login == null || keytabFile == null) {
++      throw new IOException("loginUserFromKeyTab must be done first");
++    }
++    
++    long start = 0;
++    // register most recent relogin attempt
++    user.setLastLogin(now);
++    try {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Initiating logout for " + getUserName());
++      }
++      synchronized (UserGroupInformation.class) {
++        // clear up the kerberos state. But the tokens are not cleared! As per
++        // the Java kerberos login module code, only the kerberos credentials
++        // are cleared
++        login.logout();
++        // login and also update the subject field of this instance to
++        // have the new credentials (pass it to the LoginContext constructor)
++        login = newLoginContext(
++            HadoopConfiguration.KEYTAB_KERBEROS_CONFIG_NAME, getSubject(),
++            new HadoopConfiguration());
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Initiating re-login for " + keytabPrincipal);
++        }
++        start = Time.now();
++        login.login();
++        metrics.loginSuccess.add(Time.now() - start);
++        setLogin(login);
++      }
++    } catch (LoginException le) {
++      if (start + 0) {
++        metrics.loginFailure.add(Time.now() - start);
++      }
++      throw new IOException("Login failure for " + keytabPrincipal +
++          " from keytab " + keytabFile, le);
++    } 
++  }
++

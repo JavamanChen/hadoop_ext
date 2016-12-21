@@ -1,0 +1,201 @@
+Index: hbase-protocol/src/main/protobuf/Client.proto
+===================================================================
+--- hbase-protocol/src/main/protobuf/Client.proto	(revision 239357)
++++ hbase-protocol/src/main/protobuf/Client.proto	(working copy)
+@@ -440,7 +440,14 @@
+   optional bool processed = 2;
+ }
+ 
++message GetRegionFromScannerRequest {
++  required string scannerId = 1;
++}
+ 
++message GetRegionFromScannerResponse {
++  required string regionName = 1;
++}
++
+ service ClientService {
+   rpc Get(GetRequest)
+     returns(GetResponse);
+@@ -462,4 +469,7 @@
+ 
+   rpc Multi(MultiRequest)
+     returns(MultiResponse);
++  
++  rpc GetRegionFromScanner(GetRegionFromScannerRequest)
++    returns(GetRegionFromScannerResponse);
+ }
+Index: hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/CallRunner.java
+===================================================================
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/CallRunner.java	(revision 239357)
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/CallRunner.java	(working copy)
+@@ -23,13 +23,26 @@
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.ipc.RpcServer.Call;
+ import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandler;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.BulkLoadHFileRequest;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServiceRequest;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRegionFromScannerRequest;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRegionFromScannerResponse;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRequest;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRequest;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutateRequest;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ScanRequest;
++import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.Pair;
++import org.apache.hadoop.metrics2.lib.DynamicMetricsRegistry;
++import org.apache.hadoop.metrics2.lib.MutableCounterLong;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.htrace.Trace;
+ import org.apache.htrace.TraceScope;
+ 
++import com.google.protobuf.Descriptors.MethodDescriptor;
+ import com.google.protobuf.Message;
++import com.google.protobuf.ServiceException;
+ 
+ /**
+  * The request processing logic, which is usually executed in thread pools provided by an
+@@ -90,6 +103,32 @@
+       String error = null;
+       Pair<Message, CellScanner> resultPair = null;
+       RpcServer.CurCall.set(call);
++      
++      String paramStr = call.param.getClass().getName();
++      String regionName = null;
++	   if(paramStr.endsWith("GetRequest")){
++        GetRequest gr = (GetRequest) call.param;
++        regionName = Bytes.toStringBinary(gr.getRegion().getValue().toByteArray());
++      }else if(paramStr.endsWith("ScanRequest")){
++        ScanRequest sr = (ScanRequest) call.param;
++        regionName = getRegionNameFromScanner(sr);
++      }else if(paramStr.endsWith("MultiRequest")){
++        MultiRequest mr = (MultiRequest) call.param;
++        if(mr.getRegionActionCount() > 0){
++          regionName = Bytes.toStringBinary(mr.getRegionActionList().get(0).getRegion().getValue().toByteArray());
++        }
++      }else if(paramStr.endsWith("MutateRequest")){
++        MutateRequest mr = (MutateRequest) call.param;
++        regionName = Bytes.toStringBinary(mr.getRegion().getValue().toByteArray());
++      }else if(paramStr.endsWith("CoprocessorServiceRequest")){
++        CoprocessorServiceRequest csr = (CoprocessorServiceRequest) call.param;
++        regionName = Bytes.toStringBinary(csr.getRegion().getValue().toByteArray());
++      }else if(paramStr.endsWith("BulkLoadHFileRequest")){
++        BulkLoadHFileRequest blr = (BulkLoadHFileRequest) call.param;
++        regionName = Bytes.toStringBinary(blr.getRegion().getValue().toByteArray());
++      }
++      
+       TraceScope traceScope = null;
+       try {
+         if (!this.rpcServer.isStarted()) {
+@@ -124,6 +163,18 @@
+         call.setResponse(param, cells, errorThrowable, error);
+       }
+       call.sendResponseIfReady();
++      
++      if(regionName != null && !"".equals(regionName.trim())){
++        String tableName = regionName.split(",")[0];
++        tableName = tableName.replace(":", "_");
++        MetricsHBaseServerSourceImpl metricsSource = (MetricsHBaseServerSourceImpl) rpcServer.getMetrics().getMetricsSource();
++        DynamicMetricsRegistry registry = metricsSource.getMetricsRegistry();
++        MutableCounterLong inputMetrics = registry.getLongCounter(tableName+"_input", 0L);
++        inputMetrics.incr(call.size);
++        MutableCounterLong outputMetrics = registry.getLongCounter(tableName+"_output", 0L);
++        outputMetrics.incr(call.responseSize);
++      }
++      
+       this.status.markComplete("Sent response");
+       this.status.pause("Waiting for a call");
+     } catch (OutOfMemoryError e) {
+@@ -151,4 +202,19 @@
+       cleanup();
+     }
+   }
++
++  private String getRegionNameFromScanner(ScanRequest sr) throws ServiceException {
++    long scannerId = sr.getScannerId();
++    String regionName = null;
++    if(scannerId == 0L){
++      regionName = Bytes.toStringBinary(sr.getRegion().getValue().toByteArray());
++    }else{
++      MethodDescriptor getScannerMd = call.service.getDescriptorForType().findMethodByName("GetRegionFromScanner");
++      Message param = GetRegionFromScannerRequest.newBuilder().setScannerId(String.valueOf(scannerId)).build();
++      GetRegionFromScannerResponse result = (GetRegionFromScannerResponse) call.service.callBlockingMethod(getScannerMd, null, param);
++      regionName = result.getRegionName();
++    }
++    return regionName;
++  }
++  
+ }
+Index: hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
+===================================================================
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java	(revision 239357)
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java	(working copy)
+@@ -299,6 +299,7 @@
+     protected boolean delayReturnValue;           // if the return value should be
+                                                   // set at call completion
+     protected long size;                          // size of current call
++    protected long responseSize;
+     protected boolean isError;
+     protected TraceInfo tinfo;
+     private ByteBuffer cellBlock = null;
+@@ -421,6 +422,7 @@
+         ByteBuffer bbResult = IPCUtil.getDelimitedMessageAsByteBuffer(result);
+         int totalSize = bbHeader.capacity() + (bbResult == null? 0: bbResult.limit()) +
+           (this.cellBlock == null? 0: this.cellBlock.limit());
++        this.responseSize = totalSize;
+         ByteBuffer bbTotalSize = ByteBuffer.wrap(Bytes.toBytes(totalSize));
+         bc = new BufferChain(bbTotalSize, bbHeader, bbResult, this.cellBlock);
+         if (connection.useWrap) {
+Index: hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+===================================================================
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java	(revision 239357)
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java	(working copy)
+@@ -131,6 +131,8 @@
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.Condition;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServiceRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServiceResponse;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRegionFromScannerRequest;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRegionFromScannerResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRequest;
+@@ -2567,4 +2569,13 @@
+     }
+     return UpdateConfigurationResponse.getDefaultInstance();
+   }
++  
++  @Override
++  public GetRegionFromScannerResponse getRegionFromScanner(
++      RpcController controller, GetRegionFromScannerRequest request)
++      throws ServiceException {
++    String scannerId = request.getScannerId();
++    String regionName = getScanner(Long.parseLong(scannerId)).getRegionInfo().getRegionNameAsString();
++    return GetRegionFromScannerResponse.newBuilder().setRegionName(regionName).build();
++  }
+ }
+Index: hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+===================================================================
+--- hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java	(revision 239357)
++++ hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java	(working copy)
+@@ -85,6 +85,8 @@
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.BulkLoadHFileResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServiceRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServiceResponse;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRegionFromScannerRequest;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRegionFromScannerResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRequest;
+@@ -649,4 +651,11 @@
+   public double getCompactionPressure() {
+     return 0;
+   }
++
++  @Override
++  public GetRegionFromScannerResponse getRegionFromScanner(
++      RpcController controller, GetRegionFromScannerRequest request)
++      throws ServiceException {
++    return null;
++  }
+ }

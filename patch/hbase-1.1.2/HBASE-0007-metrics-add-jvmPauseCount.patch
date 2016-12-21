@@ -1,0 +1,126 @@
+ .../hadoop/hbase/regionserver/MetricsRegionServerSource.java  |  3 +++
+ .../hbase/regionserver/MetricsRegionServerSourceImpl.java     |  7 +++++++
+ .../org/apache/hadoop/hbase/regionserver/HRegionServer.java   |  6 ++++--
+ .../java/org/apache/hadoop/hbase/util/JvmPauseMonitor.java    | 11 ++++++++++-
+ 4 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java
+index 18c3f09..5ee6e4b 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java
+@@ -96,6 +96,7 @@ public interface MetricsRegionServerSource extends BaseSource {
+    */
+   void updateScannerNext(long scanSize);
+ 
++  void incrJvmPause();
+   /**
+    * Increment the number of slow Puts that have happened.
+    */
+@@ -239,6 +240,8 @@ public interface MetricsRegionServerSource extends BaseSource {
+   String APPEND_KEY = "append";
+   String REPLAY_KEY = "replay";
+   String SCAN_NEXT_KEY = "scanNext";
++  String JVM_PAUSE_KEY = "jvmPauseCount";
++  String JVM_PAUSE_DESC = "The number of JvmPause that above 1000ms";
+   String SLOW_MUTATE_KEY = "slowPutCount";
+   String SLOW_GET_KEY = "slowGetCount";
+   String SLOW_DELETE_KEY = "slowDeleteCount";
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java
+index de629c8..8d3b25a 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java
+@@ -44,6 +44,7 @@ public class MetricsRegionServerSourceImpl
+   private final MetricHistogram replayHisto;
+   private final MetricHistogram scanNextHisto;
+ 
++  private final MutableCounterLong jvmPause;
+   private final MutableCounterLong slowPut;
+   private final MutableCounterLong slowDelete;
+   private final MutableCounterLong slowGet;
+@@ -68,6 +69,7 @@ public class MetricsRegionServerSourceImpl
+     this.rsWrap = rsWrap;
+ 
+     putHisto = getMetricsRegistry().newHistogram(MUTATE_KEY);
++    jvmPause = getMetricsRegistry().newCounter(JVM_PAUSE_KEY, JVM_PAUSE_DESC, 0l);
+     slowPut = getMetricsRegistry().newCounter(SLOW_MUTATE_KEY, SLOW_MUTATE_DESC, 0l);
+ 
+     deleteHisto = getMetricsRegistry().newHistogram(DELETE_KEY);
+@@ -128,6 +130,11 @@ public class MetricsRegionServerSourceImpl
+   }
+ 
+   @Override
++  public void incrJvmPause(){
++    jvmPause.incr();
++  }
++
++  @Override
+   public void incrSlowPut() {
+    slowPut.incr();
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index b388111..b36f635 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -726,8 +726,6 @@ public class HRegionServer extends HasThread implements
+           HConstants.DEFAULT_THREAD_WAKE_FREQUENCY);
+         healthCheckChore = new HealthCheckChore(sleepTime, this, getConfiguration());
+       }
+-      this.pauseMonitor = new JvmPauseMonitor(conf);
+-      pauseMonitor.start();
+ 
+       initializeZooKeeper();
+       if (!isStopped() && !isAborted()) {
+@@ -1363,6 +1361,10 @@ public class HRegionServer extends HasThread implements
+       // Init in here rather than in constructor after thread name has been set
+       this.metricsRegionServer = new MetricsRegionServer(new MetricsRegionServerWrapperImpl(this));
+ 
++      this.pauseMonitor = new JvmPauseMonitor(conf);
++      pauseMonitor.setMetricsSource(this.metricsRegionServer.getMetricsSource());
++      pauseMonitor.start();
++
+       startServiceThreads();
+       startHeapMemoryManager();
+       LOG.info("Serving as " + this.serverName +
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/JvmPauseMonitor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/JvmPauseMonitor.java
+index 80fde68..70bae4a 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/JvmPauseMonitor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/JvmPauseMonitor.java
+@@ -26,6 +26,7 @@ import java.util.Set;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.regionserver.MetricsRegionServerSource;
+ import org.apache.hadoop.conf.Configuration;
+ 
+ import com.google.common.base.Joiner;
+@@ -68,6 +69,7 @@ public class JvmPauseMonitor {
+ 
+   private Thread monitorThread;
+   private volatile boolean shouldRun = true;
++  private MetricsRegionServerSource metrics;
+ 
+   public JvmPauseMonitor(Configuration conf) {
+     this.warnThresholdMs = conf.getLong(WARN_THRESHOLD_KEY, WARN_THRESHOLD_DEFAULT);
+@@ -91,7 +93,11 @@ public class JvmPauseMonitor {
+       Thread.currentThread().interrupt();
+     }
+   }
+-  
++
++  public void setMetricsSource(MetricsRegionServerSource metrics){
++    this.metrics = metrics;
++  }
++
+   private String formatMessage(long extraSleepTime, Map<String, GcTimes> gcTimesAfterSleep,
+       Map<String, GcTimes> gcTimesBeforeSleep) {
+ 
+@@ -163,6 +169,9 @@ public class JvmPauseMonitor {
+         long extraSleepTime = sw.elapsedMillis() - SLEEP_INTERVAL_MS;
+         Map<String, GcTimes> gcTimesAfterSleep = getGcTimes();
+ 
++        if(metrics != null && extraSleepTime > infoThresholdMs){
++          metrics.incrJvmPause();
++        }
+         if (extraSleepTime > warnThresholdMs) {
+           LOG.warn(formatMessage(extraSleepTime, gcTimesAfterSleep, gcTimesBeforeSleep));
+         } else if (extraSleepTime > infoThresholdMs) {

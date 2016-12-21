@@ -1,0 +1,88 @@
+ .../java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java | 6 +++++-
+ .../org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java  | 7 +++++++
+ .../main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java  | 4 ++++
+ .../src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java       | 3 +++
+ 4 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+index 482fdba..eaaec7a 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+@@ -67,6 +67,8 @@ public interface MetricsHBaseServerSource extends BaseSource {
+   String EXCEPTIONS_SANITY_NAME="exceptions.FailedSanityCheckException";
+   String EXCEPTIONS_MOVED_NAME="exceptions.RegionMovedException";
+   String EXCEPTIONS_NSRE_NAME="exceptions.NotServingRegionException";
++  String RES_TOO_SLOW_NAME="responseTooSlow";
++  String RES_TOO_SLOW_DESC="process Call for a long time";
+ 
+   void authorizationSuccess();
+ 
+@@ -97,4 +99,6 @@ public interface MetricsHBaseServerSource extends BaseSource {
+   void processedCall(int processingTime);
+ 
+   void queuedAndProcessedCall(int totalTime);
+-  }
++
++  void responseTooSlow();
++}
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+index dadf9de..8132d8f 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+@@ -38,6 +38,7 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
+   private final MutableCounterLong authenticationFailures;
+   private final MutableCounterLong sentBytes;
+   private final MutableCounterLong receivedBytes;
++  private final MutableCounterLong responseTooSlows;
+ 
+   private final MutableCounterLong exceptions;
+   private final MutableCounterLong exceptionsOOO;
+@@ -93,6 +94,7 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
+         PROCESS_CALL_TIME_DESC);
+     this.totalCallTime = this.getMetricsRegistry().newHistogram(TOTAL_CALL_TIME_NAME,
+         TOTAL_CALL_TIME_DESC);
++    this.responseTooSlows = this.getMetricsRegistry().newCounter(RES_TOO_SLOW_NAME, RES_TOO_SLOW_DESC, 0L);
+   }
+ 
+   @Override
+@@ -176,6 +178,11 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
+   }
+ 
+   @Override
++  public void responseTooSlow() {
++    responseTooSlows.incr();
++  }
++
++  @Override
+   public void getMetrics(MetricsCollector metricsCollector, boolean all) {
+     MetricsRecordBuilder mrb = metricsCollector.addRecord(metricsName);
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+index 3ca50ad..835713b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+@@ -73,6 +73,10 @@ public class MetricsHBaseServer {
+     source.queuedAndProcessedCall(totalTime);
+   }
+ 
++  void responseTooSlow(){
++    source.responseTooSlow();
++  }
++
+   public void exception(Throwable throwable) {
+     source.exception();
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
+index 0475a67..65dacb6 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
+@@ -2130,6 +2130,9 @@ public class RpcServer implements RpcServerInterface {
+       // log any RPC responses that are slower than the configured warn
+       // response time or larger than configured warning size
+       boolean tooSlow = (processingTime > warnResponseTime && warnResponseTime > -1);
++      if(tooSlow){
++        metrics.responseTooSlow();
++      }
+       boolean tooLarge = (responseSize > warnResponseSize && warnResponseSize > -1);
+       if (tooSlow || tooLarge) {
+         // when tagging, we let TooLarge trump TooSmall to keep output simple
